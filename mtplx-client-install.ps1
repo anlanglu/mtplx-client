@@ -437,7 +437,7 @@ if (Test-Path $PLUGIN_INDEX) {
     @"
 const mtplxProviderID = (input) =>
   input?.model?.providerID || input?.provider?.id;
-const mtplxProviderIDs = new Set(["mtplx", "mtplx-27b", "mtplx-35b", "mtplx-inkling"]);
+const mtplxProviderIDs = new Set(["mtplx", "mtplx-27b", "mtplx-35b", "mtplx-inkling", "mtplx-flashnext"]);
 
 const mtplxInjectedOutputCap = 32000;
 const mtplxRequestedOutputHeader = "x-mtplx-max-response-tokens";
@@ -520,7 +520,7 @@ export default {
       event.headers["x-mtplx-session-id"] = String(event.sessionID);
       if (event.kind) event.headers["x-mtplx-request-kind"] = String(event.kind);
     };
-    for (const providerID of ["mtplx", "mtplx-27b", "mtplx-35b", "mtplx-inkling"]) {
+    for (const providerID of ["mtplx", "mtplx-27b", "mtplx-35b", "mtplx-inkling", "mtplx-flashnext"]) {
       await ctx.session.hook("model.request", handler, { providerID });
     }
   }
