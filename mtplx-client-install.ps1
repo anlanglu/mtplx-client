@@ -12,8 +12,10 @@
       3. Installs the mtplx-session-headers plugin (bundled below, self-contained)
       4. Writes ~/.config/opencode/opencode.jsonc so all five MTPLX providers
          point at the host's Tailscale URL with your personal API key
-      5. Logs Tailscale in (prints a URL you click exactly once)
-      6. Verifies the link: GET /health and, with your key, GET /mtplx-27b/v1/models
+      5. Would install MiniMax H3-Image locally — NOT SUPPORTED on Windows
+         (it is an MLX model and needs Apple Silicon). Use -SkipImage on
+         Apple-silicon Macs running the .sh installer to leave it out.
+      6. Logs Tailscale in (prints a URL you click exactly once)
 
     Only prompts and streamed completion tokens cross the wire — the session,
     files and tool output stay on this machine. That is what keeps it usable on a
@@ -33,6 +35,9 @@
     Skip the Tailscale install step (useful for re-running after manual login).
 .PARAMETER SkipOpencode
     Skip the OpenCode install step.
+.PARAMETER SkipImage
+    Accepted for parity with the macOS script; on Windows local image
+    generation is skipped anyway (H3-Image requires Apple Silicon).
 .PARAMETER NoVerify
     Skip the network verification at the end.
 .PARAMETER Help
@@ -62,6 +67,9 @@ param(
     [Parameter(HelpMessage="Skip OpenCode install step")]
     [switch]$SkipOpencode,
 
+    [Parameter(HelpMessage="Skip local H3-Image (Windows skips it anyway — needs Apple Silicon)")]
+    [switch]$SkipImage,
+
     [Parameter(HelpMessage="Skip network verification at the end")]
     [switch]$NoVerify
 )
@@ -90,6 +98,7 @@ function Get-HelpText {
     Write-Output "  -Fresh       Write a clean config instead of merging."
     Write-Output "  -SkipTailscale  Skip Tailscale install."
     Write-Output "  -SkipOpencode   Skip OpenCode install."
+    Write-Output "  -SkipImage      Skip local H3-Image (automatic: not supported on Windows)."
     Write-Output "  -NoVerify      Skip network verification."
 }
 
@@ -123,6 +132,7 @@ if ($PSCmdlet.ParameterSetName -eq "") {
             "-Fresh"        { $Fresh = $true; break }
             "-SkipTailscale"{ $SkipTailscale = $true; break }
             "-SkipOpencode" { $SkipOpencode = $true; break }
+            "-SkipImage"    { $SkipImage = $true; break }
             "-NoVerify"     { $NoVerify = $true; break }
             "-h", "-Help"   { Get-HelpText; exit 0 }
             default         { Err "unknown argument: $($args[$i])"; Get-HelpText; exit 2 }
@@ -160,6 +170,7 @@ $PLUGIN_DIR = Join-Path $OC_CONFIG_DIR "plugins" "mtplx-session-headers"
 $PLUGIN_INDEX = Join-Path $PLUGIN_DIR "index.js"
 $PLUGIN_SERVER = Join-Path $PLUGIN_DIR "server.js"
 $PLUGIN_PKG = Join-Path $PLUGIN_DIR "package.json"
+$IMAGE_PLUGIN_DIR = Join-Path $OC_CONFIG_DIR "plugins" "mtplx-image-generation"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -198,21 +209,16 @@ if ($isAdmin) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: Tailscale
+# Step 1/6: Install Tailscale
 # ---------------------------------------------------------------------------
-if (-not $SkipTailscale) {
-    Step "Tailscale"
+if ($SkipTailscale) {
+    Step "1/6  Install Tailscale (skipped)"
+    Info "-SkipTailscale set."
+} else {
+    Step "1/6  Install Tailscale"
 
     if (Test-Command "tailscale") {
         Ok "Tailscale CLI already installed"
-
-        # Check if already logged in
-        $tsStatus = tailscale status 2>&1 | Out-String
-        if ($tsStatus -match "BackendState: Running" -or $tsStatus -match "<host-tailnet-name>") {
-            Info "Tailscale appears to be logged in"
-        } else {
-            Info "Tailscale is installed but may not be logged in yet"
-        }
     } else {
         Info "Installing Tailscale via winget..."
         $wingetResult = winget install --id Tailscale.Tailscale --accept-source-agreements --accept-package-agreements 2>&1 | Out-String
@@ -253,91 +259,16 @@ if (-not $SkipTailscale) {
         }
         Ok "Tailscale CLI available"
     }
-
-    # Set hostname
-    Info "Setting Tailscale hostname to '$Hostname'..."
-    try {
-        tailscale set --hostname=$Hostname 2>&1 | Out-Null
-        Ok "Hostname set to $Hostname"
-    } catch {
-        Warn "Could not set hostname (may require re-login): $_"
-    }
-
-    # Login if needed
-    $tsStatus = tailscale status 2>&1 | Out-String
-    $isLoggedOut = $tsStatus -match "logged out"
-    $isUnreachable = $tsStatus -match "could not connect|no such file|connection refused"
-
-    if ($isUnreachable) {
-        Warn "The Tailscale daemon is not reachable yet."
-        Warn "Open the Tailscale app (system-tray icon), give it a moment, then re-run."
-        exit 0
-    }
-
-    if ($isLoggedOut) {
-        Info "Starting 'tailscale up' — this prints a one-time login URL."
-        $tsUpLog = Join-Path $env:TEMP "mtplx-ts-up.log"
-        $proc = Start-Process -FilePath "tailscale" -ArgumentList "up", "--hostname=$Hostname" -NoNewWindow -PassThru -RedirectStandardOutput $tsUpLog
-        $url = ""
-        for ($i = 0; $i -lt 30; $i++) {
-            if (Test-Path $tsUpLog) {
-                $content = Get-Content $tsUpLog -Raw -ErrorAction SilentlyContinue
-                if ($content -match '(https://login\.tailscale\.com/[A-Za-z0-9/_-]+)') {
-                    $url = $Matches[1]
-                    break
-                }
-            }
-            Start-Sleep -Seconds 1
-            if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { break }
-        }
-        if ($url) {
-            Write-Output ""
-            Write-Output "  Open this URL in your browser and log in (one time):"
-            Write-Output "      $url"
-            Write-Output "  (If it looks expired, re-run this script — it is idempotent.)"
-            Write-Output ""
-            Start-Process $url 2>$null
-        } else {
-            Warn "No login URL appeared yet; check the Tailscale app in the system tray."
-        }
-        Info "Waiting for you to complete the login (up to ~10 minutes)…"
-        $logged = 0
-        for ($i = 0; $i -lt 300; $i++) {
-            $check = tailscale status 2>&1 | Out-String
-            if ($check -notmatch "logged out" -and $check -notmatch "NeedsLogin") {
-                $logged = 1
-                break
-            }
-            Start-Sleep -Seconds 2
-        }
-        Wait-Process -Id $proc.Id -ErrorAction SilentlyContinue
-        Remove-Item $tsUpLog -ErrorAction SilentlyContinue
-        if ($logged) {
-            Ok "Tailscale is logged in. This machine is on the tailnet."
-            tailscale status 2>&1 | ForEach-Object { "    $_" }
-        } else {
-            Warn "Not logged in yet. Complete the login, then re-run this script"
-            Warn "(everything else is already installed, so it will just verify)."
-            exit 0
-        }
-    } else {
-        Ok "Tailscale is already logged in."
-    }
-
-    # Verify we can reach the host
-    $tsServeStatus = tailscale serve status 2>&1 | Out-String
-    if ($tsServeStatus -match "127.0.0.1:8100") {
-        Ok "Tailscale serve pointing to router"
-    } else {
-        Info "Tailscale serve config: $tsServeStatus"
-    }
 }
 
 # ---------------------------------------------------------------------------
-# Step 2: OpenCode
+# Step 2/6: Install OpenCode
 # ---------------------------------------------------------------------------
-if (-not $SkipOpencode) {
-    Step "OpenCode"
+if ($SkipOpencode) {
+    Step "2/6  Install OpenCode (skipped)"
+    Info "-SkipOpencode set."
+} else {
+    Step "2/6  Install OpenCode"
 
     if (Test-Path $OC_BIN) {
         $ver = & $OC_BIN --version 2>&1 | Select-String -Pattern "opencode" | Select-Object -First 1
@@ -406,14 +337,19 @@ if (-not $SkipOpencode) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3: Plugin — mtplx-session-headers
+# Step 3/6: Install MTPLX plugins
+#
+#   • mtplx-session-headers  (routing fixes) — installed here.
+#   • mtplx-image-generation (local generate_image tool) — NOT installed:
+#     H3-Image is an MLX model that only runs on Apple Silicon, so on
+#     Windows there is nothing for the tool to call.
 # ---------------------------------------------------------------------------
-Step "Plugin: mtplx-session-headers"
+Step "3/6  Install MTPLX plugins"
 
 if (Test-Path $PLUGIN_INDEX) {
-    Ok "Plugin already installed"
+    Ok "mtplx-session-headers already installed"
 } else {
-    Info "Installing plugin..."
+    Info "Installing mtplx-session-headers..."
 
     if (-not (Test-Path $PLUGIN_DIR)) {
         New-Item -ItemType Directory -Path $PLUGIN_DIR -Force | Out-Null
@@ -530,10 +466,18 @@ export default {
     Ok "Plugin installed to $PLUGIN_DIR"
 }
 
+if ($SkipImage) {
+    Info "-SkipImage set: image-generation plugin not installed."
+} else {
+    Info "H3-Image is an MLX model and only runs on Apple Silicon (macOS)."
+    Info "The image-generation plugin is not installed here; there is nothing"
+    Info "for its 'generate_image' tool to call on Windows."
+}
+
 # ---------------------------------------------------------------------------
-# Step 4: Config — opencode.jsonc
+# Step 4/6: Write OpenCode config
 # ---------------------------------------------------------------------------
-Step "Config: opencode.jsonc"
+Step "4/6  Write OpenCode config"
 
 # Ensure directories exist
 if (-not (Test-Path $OC_CONFIG_DIR)) {
@@ -564,6 +508,10 @@ $env:MTPLX_KEY = $Key
 $env:MTPLX_PLUGIN_DIR = $PLUGIN_DIR
 $env:MTPLX_CFG_FILE = $OC_CONFIG_FILE
 $env:MTPLX_FRESH = if ($Fresh) { "1" } else { "0" }
+$env:MTPLX_IMAGE_PLUGIN_DIR = $IMAGE_PLUGIN_DIR
+# On Windows local image generation is never available (needs Apple
+# Silicon), so the image plugin is never registered.
+$env:MTPLX_SKIP_IMG = "1"
 
 $pythonScript = @'
 import json, os, sys, urllib.request, urllib.error
@@ -573,6 +521,8 @@ key = os.environ["MTPLX_KEY"]
 plugin_path = os.environ["MTPLX_PLUGIN_DIR"]
 cfg_path = os.environ["MTPLX_CFG_FILE"]
 fresh = os.environ.get("MTPLX_FRESH", "0") == "1"
+image_plugin_path = os.environ["MTPLX_IMAGE_PLUGIN_DIR"]
+skip_img = os.environ.get("MTPLX_SKIP_IMG", "1")
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +654,13 @@ cfg["agents"] = {
 plugins = cfg.get("plugins", [])
 if plugin_path not in plugins:
     plugins.append(plugin_path)
+# Only list the image plugin when it was actually installed (or kept from
+# an earlier run with it present on disk).
+if skip_img == "0" or os.path.isdir(image_plugin_path):
+    if image_plugin_path not in plugins:
+        plugins.append(image_plugin_path)
+else:
+    plugins = [p for p in plugins if p != image_plugin_path]
 cfg["plugins"] = plugins
 
 with open(cfg_path, "w") as f:
@@ -721,7 +678,7 @@ try {
     if ($LASTEXITCODE -eq 0) {
         Ok "Config written to $OC_CONFIG_FILE"
         if ($Fresh) {
-            Info "mode: --fresh (MTPLX-only config; other providers, if any, are in the backup)."
+            Info "mode: -Fresh (MTPLX-only config; other providers, if any, are in the backup)."
         } else {
             Info "mode: merge (your other providers, if any, were preserved)."
         }
@@ -747,7 +704,8 @@ try {
       }
     }
   },
-  "compaction": {"auto": true, "buffer": "25%"}
+  "compaction": {"auto": true, "buffer": "25%"},
+  "plugins": ["$PLUGIN_DIR"]
 }
 "@
         $fallback | Set-Content $OC_CONFIG_FILE -Encoding UTF8
@@ -758,10 +716,116 @@ try {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5: Verification
+# Step 5/6: Install MiniMax H3-Image — skipped on Windows
 # ---------------------------------------------------------------------------
-if (-not $NoVerify) {
-    Step "Verification"
+if ($SkipImage) {
+    Step "5/6  Install MiniMax H3-Image (skipped)"
+    Info "-SkipImage set; the generate_image tool will report 'not installed' until you install it."
+} else {
+    Step "5/6  Install MiniMax H3-Image"
+    Info "H3-Image is distributed as an MLX model (Apple Metal) and only"
+    Info "supports macOS on Apple Silicon. Nothing to install on Windows."
+    Info "If you re-run this on an Apple-silicon Mac with the .sh installer,"
+    Info "step 5/6 sets up python@3.12, h3-image-mlx and ~49 GB of weights."
+}
+
+# ---------------------------------------------------------------------------
+# Step 6/6: Log in to Tailscale
+# ---------------------------------------------------------------------------
+Step "6/6  Log in to Tailscale"
+
+if (-not (Test-Command "tailscale")) {
+    # winget may place tailscale.exe in Program Files without refreshing PATH.
+    $tsExe = "$env:ProgramFiles\Tailscale\Tailscale.exe"
+    $shimDir = Join-Path $HOME_DIR ".opencode" "bin"
+    $shimPath = Join-Path $shimDir "tailscale.cmd"
+    if (Test-Path $tsExe) {
+        if (-not (Test-Path $shimDir)) { New-Item -ItemType Directory -Path $shimDir -Force | Out-Null }
+        Set-Content $shimPath "@`"$tsExe`" %*" -Encoding UTF8
+        $env:PATH = "$shimDir;$env:PATH"
+        Ok "Created tailscale shim"
+    } else {
+        Warn "tailscale CLI not found on PATH."
+        Info "Open the Tailscale app, then re-run this script — it is idempotent."
+        exit 0
+    }
+}
+
+# 0 = logged in, 1 = logged out, 2 = daemon unreachable
+function Get-TailscaleState {
+    $out = (tailscale status 2>&1 | Out-String)
+    if ($out -match "could not connect|no such file|connection refused|not running") { return 2 }
+    if ($out -match "logged out") { return 1 }
+    return 0
+}
+
+switch (Get-TailscaleState) {
+    1 {
+        # logged out → run `tailscale up`, print the one-time URL, wait
+        Info "Starting 'tailscale up' — this prints a one-time login URL."
+        $tsUpLog = Join-Path $env:TEMP "mtplx-ts-up.log"
+        $proc = Start-Process -FilePath "tailscale" -ArgumentList "up", "--hostname=$Hostname" -NoNewWindow -PassThru -RedirectStandardOutput $tsUpLog
+        $url = ""
+        for ($i = 0; $i -lt 30; $i++) {
+            if (Test-Path $tsUpLog) {
+                $content = Get-Content $tsUpLog -Raw -ErrorAction SilentlyContinue
+                if ($content -match '(https://login\.tailscale\.com/[A-Za-z0-9/_-]+)') {
+                    $url = $Matches[1]
+                    break
+                }
+            }
+            Start-Sleep -Seconds 1
+            if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { break }
+        }
+        if ($url) {
+            Write-Output ""
+            Write-Output "  Open this URL in your browser and log in (one time):"
+            Write-Output "      $url"
+            Write-Output "  (If it looks expired, re-run this script — it is idempotent.)"
+            Write-Output ""
+            Start-Process $url 2>$null
+        } else {
+            Warn "No login URL appeared yet; check the Tailscale app in the system tray."
+        }
+        Info "Waiting for you to complete the login (up to ~10 minutes)…"
+        $logged = 0
+        for ($i = 0; $i -lt 300; $i++) {
+            $check = tailscale status 2>&1 | Out-String
+            if ($check -notmatch "logged out" -and $check -notmatch "NeedsLogin") {
+                $logged = 1
+                break
+            }
+            Start-Sleep -Seconds 2
+        }
+        Wait-Process -Id $proc.Id -ErrorAction SilentlyContinue
+        Remove-Item $tsUpLog -ErrorAction SilentlyContinue
+        if ($logged) {
+            Ok "Tailscale is logged in. This machine is on the tailnet."
+            tailscale status 2>&1 | ForEach-Object { "    $_" }
+        } else {
+            Warn "Not logged in yet. Complete the login, then re-run this script"
+            Warn "(everything else is already installed, so it will just verify)."
+            exit 0
+        }
+    }
+    2 {
+        Warn "The Tailscale daemon is not reachable yet."
+        Warn "Open the Tailscale app (system-tray icon), give it a moment, then re-run."
+        exit 0
+    }
+    default {
+        Ok "Tailscale is already logged in."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Verify the connection
+# ---------------------------------------------------------------------------
+if ($NoVerify) {
+    Step "Verify (skipped)"
+    Info "-NoVerify set."
+} else {
+    Step "Verify the connection"
 
     # Check Tailscale connectivity
     Info "Checking Tailscale connectivity..."

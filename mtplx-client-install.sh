@@ -2,7 +2,7 @@
 #
 # mtplx-client-install.sh
 #
-# Version: 2026-11-26-2130
+# Version: 2026-11-27-0100
 #
 # One-shot installer for the MTPLX *client* side of the shared-models setup.
 # Run this on each remote person's Mac. It does everything a remote user needs
@@ -10,11 +10,14 @@
 #
 #   1. Installs Tailscale            (brew install --cask tailscale)
 #   2. Installs OpenCode             (official installer, binary in ~/.opencode/bin)
-#   3. Installs the mtplx-session-headers plugin (bundled below, self-contained)
+#   3. Installs two plugins: mtplx-session-headers (routing fixes) and
+#      mtplx-image-generation (a local `generate_image` tool)
 #   4. Writes ~/.config/opencode/opencode.jsonc so all five MTPLX providers
 #      point at the host's Tailscale URL with your personal API key
-#   5. Logs Tailscale in (prints a URL you click exactly once)
-#   6. Verifies the link: GET /health and, with your key, GET /mtplx-27b/v1/models
+#   5. Installs MiniMax H3-Image locally: python@3.12 + h3-image-mlx in
+#      ~/.mtplx/h3-image-mlx/.venv, then downloads ~49 GB of weights and
+#      runs one test generation. Use --skip-image to leave this out.
+#   6. Logs Tailscale in (prints a URL you click exactly once)
 #
 # Only prompts and streamed completion tokens cross the wire — the session,
 # files and tool output stay on this machine. That is what keeps it usable on a
@@ -40,6 +43,7 @@
 #                   up to opencode.jsonc.bak-<timestamp> first, so nothing is
 #                   lost either way.)
 #   --skip-tailscale   / --skip-opencode   re-run a single part without redownloading
+#   --skip-image       skip the local H3-Image install (49 GB of weights)
 #   --no-verify         skip the network verification at the end
 #   -h | --help
 #
@@ -68,12 +72,12 @@ step() { printf '\n%s\n' "${B}== ${*} ==${C}"; }
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-INSTALLER_VERSION="2026-11-26-2130"
+INSTALLER_VERSION="2026-11-27-0100"
 
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
-BASE="" KEY="" HOSTNAME="" FRESH=0 SKIP_TS=0 SKIP_OC=0 NO_VERIFY=0
+BASE="" KEY="" HOSTNAME="" FRESH=0 SKIP_TS=0 SKIP_OC=0 SKIP_IMG=0 NO_VERIFY=0
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
@@ -84,6 +88,7 @@ while [ $# -gt 0 ]; do
     --fresh)         FRESH=1; shift ;;
     --skip-tailscale) SKIP_TS=1; shift ;;
     --skip-opencode)  SKIP_OC=1; shift ;;
+    --skip-image)     SKIP_IMG=1; shift ;;
     --no-verify)     NO_VERIFY=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) err "unknown argument: $1"; usage; exit 2 ;;
@@ -173,7 +178,7 @@ if [ "$SKIP_TS" = "1" ]; then
   step "Tailscale (skipped)"
   info "--skip-tailscale set."
 else
-  step "1/4  Install Tailscale"
+  step "1/6  Install Tailscale"
   if brew list --cask tailscale >/dev/null 2>&1; then
     ok "Tailscale already installed."
   else
@@ -223,7 +228,7 @@ if [ "$SKIP_OC" = "1" ]; then
   step "OpenCode (skipped)"
   info "--skip-opencode set."
 else
-  step "2/4  Install OpenCode"
+  step "2/6  Install OpenCode"
   if command -v opencode >/dev/null 2>&1; then
     ok "OpenCode already installed: $(opencode --version 2>/dev/null | head -1 || true)"
     ensure_opencode_path
@@ -253,10 +258,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. mtplx-session-headers plugin
+# 3. MTPLX plugins: session headers (routing fixes) + image generation
 # ---------------------------------------------------------------------------
-step "3/4  Install MTPLX plugin"
+step "3/6  Install MTPLX plugins"
 PLUGIN_DIR="$HOME/.config/opencode/plugins/mtplx-session-headers"
+IMAGE_PLUGIN_DIR="$HOME/.config/opencode/plugins/mtplx-image-generation"
 mkdir -p "$PLUGIN_DIR"
 
 cat > "$PLUGIN_DIR/index.js" <<'MTPLX_PLUGIN_INDEX'
@@ -366,10 +372,200 @@ MTPLX_PLUGIN_PKG
 
 ok "plugin written to $PLUGIN_DIR"
 
+if [ "$SKIP_IMG" = "0" ]; then
+  # Same install script also drops in the local image-generation plugin.
+  mkdir -p "$IMAGE_PLUGIN_DIR"
+
+  cat > "$IMAGE_PLUGIN_DIR/index.js" <<'MTPLX_IMG_INDEX'
+// MTPLX image generation via MiniMax H3-Image, run locally through MLX.
+//
+// Registers one agent-callable tool, `generate_image`, that shells out to the
+// `h3-image-mlx` CLI installed by the MTPLX client installer in
+// ~/.mtplx/h3-image-mlx/.venv. There is no HTTP service for it: the CLI loads
+// the weights per call, so jobs are serialised through a promise chain to keep
+// memory use sane when several sessions ask at once.
+//
+// Needs macOS on Apple Silicon with the weights fetched
+// (`h3-image-mlx fetch --model h3 --precision int8 --models ~/.mtplx/h3-image-mlx/models`).
+// Anywhere else the tool still registers, but returns a clear "not available"
+// message instead of failing obscurely.
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { Plugin } from "@opencode/plugin";
+
+const H3_DIR = path.join(os.homedir(), ".mtplx", "h3-image-mlx");
+const H3_BIN = path.join(H3_DIR, ".venv", "bin", "h3-image-mlx");
+const H3_MODELS = path.join(H3_DIR, "models");
+const H3_OUT = path.join(H3_DIR, "out");
+
+const round32 = (value, fallback) => {
+  const raw = Number.isInteger(value) ? value : fallback;
+  const clamped = Math.min(4096, Math.max(256, raw));
+  return Math.round(clamped / 32) * 32;
+};
+
+const runH3 = (args, signal) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(H3_BIN, args, {
+      env: { ...process.env, H3_ASYNC: "1", H3_PREFETCH: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      signal,
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => { out = (out + String(d)).slice(-16000); });
+    child.stderr.on("data", (d) => { err = (err + String(d)).slice(-8000); });
+    // Hard ceiling: 30 minutes covers a cold load of the 21 GB DiT plus a
+    // 4096px generation on a busy machine.
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("h3-image-mlx timed out after 1800s"));
+    }, 1_800_000);
+    child.on("error", (e) => { clearTimeout(timer); reject(e); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve({ out, err });
+      else reject(new Error(`h3-image-mlx exited ${code}: ${(err || out).slice(-2000) || "no output"}`));
+    });
+  });
+
+// One generation at a time; extra requests queue behind it (the CLI reloads
+// gigabytes of weights per call, so two at once would thrash memory).
+let chain = Promise.resolve();
+const serial = (task) => {
+  const run = chain.then(task, task);
+  chain = run.catch(() => {});
+  return run;
+};
+
+export default Plugin.define({
+  id: "mtplx.image-generation",
+  async setup(ctx) {
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "generate_image",
+        description:
+          "Generate or edit an image with MiniMax H3-Image running locally via MLX. " +
+          "Text-to-image, or image editing when reference images are given. " +
+          "Takes about 20-120s per 1024x1024 image and returns the path of the saved PNG.",
+        input: {
+          type: "object",
+          properties: {
+            prompt: {
+              type: "string",
+              description:
+                "Describe the image to generate, or the edit to apply when references are given. " +
+                "Be concrete: subject, style, lighting, composition.",
+            },
+            width: {
+              type: "integer",
+              description: "Output width in pixels, multiple of 32, 256-4096. Default 1024.",
+            },
+            height: {
+              type: "integer",
+              description: "Output height in pixels, multiple of 32, 256-4096. Default 1024.",
+            },
+            seed: {
+              type: "integer",
+              description: "Optional seed for reproducible output.",
+            },
+            references: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Absolute paths to up to 16 reference images to edit. Provide when the task is to " +
+                "edit or remix existing pictures rather than a fresh generation.",
+            },
+          },
+          required: ["prompt"],
+          additionalProperties: false,
+        },
+        options: { codemode: false },
+        execute: async (input, context) => {
+          if (!existsSync(H3_BIN)) {
+            return {
+              content:
+                `Image generation is not installed here: ${H3_BIN} was not found. ` +
+                "Run the MTPLX client installer, or install python@3.12 and " +
+                "`pip install h3-image-mlx` into ~/.mtplx/h3-image-mlx/.venv, then run " +
+                "`h3-image-mlx fetch --model h3 --precision int8 " +
+                `--models ${H3_MODELS} (about 49 GB of weights).`,
+            };
+          }
+          const width = round32(input.width, 1024);
+          const height = round32(input.height, 1024);
+          const refs = Array.isArray(input.references)
+            ? input.references.filter((r) => typeof r === "string").slice(0, 16)
+            : [];
+          const missing = refs.filter((r) => !existsSync(r));
+          if (missing.length) {
+            return { content: `Reference image(s) not found: ${missing.join(", ")}` };
+          }
+          const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+          const outPath = path.join(H3_OUT, `h3-${stamp}-${Math.random().toString(36).slice(2, 6)}.png`);
+          return serial(async () => {
+            await mkdir(H3_OUT, { recursive: true });
+            await context.progress({ status: "loading H3-Image and generating…" });
+            const args = [
+              "generate",
+              "--model", "h3",
+              "--models", H3_MODELS,
+              "--precision", "int8",
+              "--dit-mode", "stream",
+              "--prompt", String(input.prompt),
+              "--output", outPath,
+              "--width", String(width),
+              "--height", String(height),
+            ];
+            if (Number.isInteger(input.seed)) args.push("--seed", String(input.seed));
+            for (const ref of refs) args.push("--reference", ref);
+            const { out, err } = await runH3(args, context.signal);
+            if (!existsSync(outPath)) {
+              return {
+                content:
+                  `h3-image-mlx finished without writing a file. Last output:\n${(out || err).slice(-1500)}`,
+              };
+            }
+            return {
+              content:
+                `Image saved to ${outPath} (${width}x${height}` +
+                `${Number.isInteger(input.seed) ? `, seed ${input.seed}` : ""}). ` +
+                "Show it to the user by reading that file, and mention where it is. " +
+                "Powered by MiniMax-H3-Image.",
+            };
+          });
+        },
+      });
+    });
+  },
+});
+MTPLX_IMG_INDEX
+
+  cat > "$IMAGE_PLUGIN_DIR/package.json" <<'MTPLX_IMG_PKG'
+{
+  "name": "mtplx-image-generation",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+MTPLX_IMG_PKG
+
+  ok "plugin written to $IMAGE_PLUGIN_DIR"
+else
+  info "--skip-image: image-generation plugin not installed."
+fi
+
 # ---------------------------------------------------------------------------
 # 4. opencode.jsonc
 # ---------------------------------------------------------------------------
-step "4/4  Write OpenCode config"
+step "4/6  Write OpenCode config"
 CONFIG_DIR="$HOME/.config/opencode"
 CONFIG="$CONFIG_DIR/opencode.jsonc"
 mkdir -p "$CONFIG_DIR"
@@ -384,10 +580,10 @@ fi
 
 # Generate/merge the config in Python (handles JSONC comments + trailing commas).
 # Discovers model IDs from the host at install time via /router/models (no auth).
-python3 - "$BASE" "$KEY" "$PLUGIN_DIR" "$CONFIG" "$FRESH" <<'MTPLX_CFG'
+python3 - "$BASE" "$KEY" "$PLUGIN_DIR" "$CONFIG" "$FRESH" "$IMAGE_PLUGIN_DIR" "$SKIP_IMG" <<'MTPLX_CFG'
 import json, os, sys, urllib.request, urllib.error
 
-base, key, plugin_path, cfg_path, fresh_s = sys.argv[1:6]
+base, key, plugin_path, cfg_path, fresh_s, image_plugin_path, skip_img = sys.argv[1:8]
 fresh = fresh_s == "1"   # argv strings are truthy in Python; parse explicitly
 base = base.rstrip("/")
 
@@ -512,6 +708,13 @@ cfg["agents"] = {
 plugins = cfg.get("plugins", [])
 if plugin_path not in plugins:
     plugins.append(plugin_path)
+# Only list the image plugin when it was actually installed (or kept from
+# an earlier run with it present on disk).
+if skip_img == "0" or os.path.isdir(image_plugin_path):
+    if image_plugin_path not in plugins:
+        plugins.append(image_plugin_path)
+else:
+    plugins = [p for p in plugins if p != image_plugin_path]
 cfg["plugins"] = plugins
 
 with open(cfg_path, "w") as f:
@@ -528,9 +731,87 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Tailscale login
+# 5. MiniMax H3-Image (local image generation via MLX)
 # ---------------------------------------------------------------------------
-step "Log in to Tailscale"
+if [ "$SKIP_IMG" = "1" ]; then
+  step "5/6  Install MiniMax H3-Image (skipped)"
+  info "--skip-image set; the generate_image tool will report 'not installed' until you install it."
+else
+  step "5/6  Install MiniMax H3-Image"
+
+  H3_DIR="$HOME/.mtplx/h3-image-mlx"
+
+  # 5a. Python 3.12 (h3-image-mlx needs >=3.11; 3.12 is what we test with)
+  PY=""
+  for candidate in /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12 "$(command -v python3.12 || true)"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then PY="$candidate"; break; fi
+  done
+  if [ -z "$PY" ]; then
+    if ! command -v brew >/dev/null 2>&1; then
+      err "Homebrew is missing, so we cannot install python@3.12."
+      err "Install python@3.12 yourself, then re-run this script (or follow the"
+      err "'Install H3-Image manually' section of the README)."
+      exit 1
+    fi
+    info "Installing python@3.12 via Homebrew (~1 minute)…"
+    brew install python@3.12 || true
+    PY="/opt/homebrew/bin/python3.12"
+    [ -x "$PY" ] || PY="/usr/local/bin/python3.12"
+    [ -x "$PY" ] || { err "python3.12 still not found after brew install."; exit 1; }
+  fi
+  ok "using $PY ($($PY --version 2>&1))"
+
+  # 5b. Dedicated venv with h3-image-mlx in it
+  if [ ! -x "$H3_DIR/.venv/bin/h3-image-mlx" ]; then
+    info "Creating venv at $H3_DIR/.venv…"
+    mkdir -p "$H3_DIR"
+    "$PY" -m venv "$H3_DIR/.venv"
+    info "Installing h3-image-mlx into it (a few GB of wheels, 2–5 minutes)…"
+    "$H3_DIR/.venv/bin/pip" install --quiet --upgrade pip
+    "$H3_DIR/.venv/bin/pip" install --quiet "h3-image-mlx==0.1.0a10"
+  else
+    info "h3-image-mlx already installed — leaving the venv untouched."
+  fi
+  ok "CLI: $H3_DIR/.venv/bin/h3-image-mlx"
+
+  # 5c. Download the weights (~49 GB total). Resumable; safe to re-run.
+  mkdir -p "$H3_DIR/models"
+  info "Downloading the model weights to $H3_DIR/models (~49 GB, this can take hours)…"
+  info "(Re-running this script resumes the download; nothing is lost.)"
+  if ! ( cd "$H3_DIR" && .venv/bin/h3-image-mlx fetch --model h3 --precision int8 --models "$H3_DIR/models" ); then
+    err "h3-image-mlx fetch failed. Check the model's page on Hugging Face for"
+    err "license acceptance and re-run this script to resume the download."
+    exit 1
+  fi
+  ok "weights downloaded ($(du -sh "$H3_DIR/models" | cut -f1))"
+
+  # 5d. One test generation to prove everything works end to end.
+  info "Running one test generation at 1024x1024 (up to 5 minutes)…"
+  mkdir -p "$H3_DIR/out"
+  if ! ( cd "$H3_DIR" && H3_ASYNC=1 H3_PREFETCH=1 .venv/bin/h3-image-mlx generate \
+      --model h3 --models "$H3_DIR/models" --precision int8 --dit-mode stream \
+      --prompt "A small orange robot waving hello, friendly cartoon style" \
+      --output "$H3_DIR/out/install-test.png" \
+      --width 1024 --height 1024 >/dev/null ); then
+    err "test generation failed; run the 'h3-image-mlx generate' line manually to see why."
+    exit 1
+  fi
+  if [ ! -f "$H3_DIR/out/install-test.png" ]; then
+    err "test generation produced no file; check 'h3-image-mlx generate' manually."
+    exit 1
+  fi
+  ok "test image written to $H3_DIR/out/install-test.png"
+
+  # 5e. License notice
+  warn "Heads up: H3-Image is distributed under the MiniMax Community License,"
+  warn "which excludes use in the US, EU, UK and South Korea and bars using"
+  warn "the model to improve other AI models. Make sure that fits your use."
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Tailscale login
+# ---------------------------------------------------------------------------
+step "6/6  Log in to Tailscale"
 if ! command -v tailscale >/dev/null 2>&1; then
   # The Tailscale cask may place the CLI in several locations.
   # Try them all, then fall back to a broad find.

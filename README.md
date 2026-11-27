@@ -5,7 +5,7 @@ at the shared MTPLX model router on the host MacBook. There are two installers:
 
 | File | Platform |
 |---|---|
-| `mtplx-client-install.sh` | macOS / Linux |
+| `mtplx-client-install.sh` | macOS (Apple Silicon) / Linux |
 | `mtplx-client-install.ps1` | Windows |
 
 ## What you get
@@ -26,6 +26,19 @@ only prompts and token streams cross the wire (~1.2 MB/s upload).
 
 Flash-Next loads ~99 GB and evicts other models — the first request triggers a
 brief 503 on the other models. That's expected.
+
+### Image generation (macOS only)
+
+The installer also sets up **local image generation** with MiniMax H3-Image
+(via an MLX port). An OpenCode plugin registers a `generate_image` tool on
+your machine — the model runs on your own Apple Silicon Mac, nothing goes to
+the host. A 1024×1024 image takes roughly 20–60 s depending on your machine;
+you need ~50 GB free disk for the weights and 32 GB+ RAM recommended. The
+weights are gated behind the MiniMax Community License (not usable in
+US/EU/UK/South Korea, and not for improving other AI models) — accept it on
+the Hugging Face repo and keep a HF token if you want the models. Windows
+machines get everything except the image plugin (MLX requires Apple
+Silicon); use `-SkipImage` / `--skip-image` to skip those steps.
 
 ## Prerequisites
 
@@ -60,8 +73,15 @@ chmod +x mtplx-client-install.sh
 1. Installs Tailscale (via Homebrew cask) and logs in if needed
 2. Installs OpenCode (latest release)
 3. Installs the `mtplx-session-headers` plugin (byte-identical to host version)
-4. Writes `~/.config/opencode/opencode.jsonc` with all 5 providers
-5. Verifies connectivity to the router
+   and the `mtplx-image-generation` plugin (see Image generation above; also
+   shipped in this repo under `plugins/`)
+4. Writes `~/.config/opencode/opencode.jsonc` with all 5 providers and both
+   plugins
+5. Installs MiniMax H3-Image: Homebrew `python@3.12`, a dedicated venv, the
+   `h3-image-mlx` package, and the gated model weights (~49 GB). Use
+   `--skip-image` to skip this; you must accept the MiniMax Community License
+   on Hugging Face (and supply `--hf-token` if gated) to get the weights
+6. Verifies connectivity to the router and the image tool
 
 **Options:**
 - `--fresh` — write a clean MTPLX-only config (preserves existing config as
@@ -88,7 +108,9 @@ cd C:\Users\<user>\Downloads
 2. Downloads and extracts OpenCode for Windows
 3. Installs the `mtplx-session-headers` plugin (byte-identical to host version)
 4. Writes `%USERPROFILE%\.config\opencode\opencode.jsonc` with all 5 providers
-5. Verifies connectivity to the router
+5. Skips MiniMax H3-Image setup (MLX requires Apple Silicon) — pass
+   `-SkipImage` to accept this; nothing else changes
+6. Verifies connectivity to the router
 
 **Options:**
 - `-Fresh` — write a clean MTPLX-only config (preserves existing config as
@@ -122,6 +144,8 @@ opencode
 - Starts on **MTPLX 27B** by default
 - Switch models with `/models`
 - Subagents run on **9B** (`mtplx`)
+- Ask for an image (e.g. "draw me a…") — on a Mac with H3-Image installed the
+  agent uses the local `generate_image` tool; it is not a router model
 - If you see 503 errors on the first Flash-Next request, that's normal
   (it loads ~99 GB and evicts other models). Subsequent requests will be fast.
 
