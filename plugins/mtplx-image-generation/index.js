@@ -8,9 +8,9 @@
 //   GET  <base>/image/v1/jobs/<id>/image -> download the finished PNG
 //
 // The host serialises jobs, so any number of clients can fire at once; each
-// one sees its queue position here through context.progress and the file
-// lands in ~/.mtplx/h3-image-mlx/out/ on this machine. No local model, no
-// Apple Silicon needed — this works the same on Windows.
+// one sees its queue position here through context.progress; the file lands
+// where the user asks (default ~/.mtplx/h3-image-mlx/out/ on this machine).
+// No local model, no Apple Silicon needed — this works the same on Windows.
 //
 // The MTPLX installer replaces __MTPLX_BASE__ (host URL, e.g.
 // https://<host>.<tailnet>.ts.net) and __MTPLX_KEY__ (your mtr_ key) when
@@ -102,6 +102,14 @@ export default Plugin.define({
               description:
                 "Absolute paths to up to 16 reference images to edit. Provide when the task is to " +
                 "edit or remix existing pictures rather than a fresh generation.",
+            },
+            output_path: {
+              type: "string",
+              description:
+                "Optional path to store the PNG. Absolute, or relative to the home " +
+                "directory; ~ is expanded. If it names a directory (or has no .png " +
+                "extension), the file gets a generated name inside it; if it ends in " +
+                ".png it is used as the file name. Default: ~/.mtplx/h3-image-mlx/out/.",
             },
           },
           required: ["prompt"],
@@ -199,13 +207,25 @@ export default Plugin.define({
             };
           }
 
-          // 3. Download the PNG to the local out directory.
-          await mkdir(OUT_DIR, { recursive: true });
+          // 3. Download the PNG to the requested path (default out dir).
+          const wantPath =
+            typeof input.output_path === "string" && input.output_path.trim()
+              ? input.output_path.trim().replace(/^~/, os.homedir())
+              : "";
           const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
-          const outPath = path.join(
-            OUT_DIR,
-            `h3-${stamp}-${Math.random().toString(36).slice(2, 6)}.png`,
-          );
+          const generated = `h3-${stamp}-${Math.random().toString(36).slice(2, 6)}.png`;
+          const asDir =
+            wantPath.endsWith("/") ||
+            wantPath.endsWith(path.sep) ||
+            !wantPath.toLowerCase().endsWith(".png");
+          const outPath = wantPath
+            ? path.resolve(
+                asDir
+                  ? path.join(path.resolve(os.homedir(), wantPath), generated)
+                  : path.resolve(os.homedir(), wantPath),
+              )
+            : path.join(OUT_DIR, generated);
+          await mkdir(path.dirname(outPath), { recursive: true });
           const imgRes = await request(`${API}/v1/jobs/${job.job_id}/image`, {
             headers: { Authorization: `Bearer ${KEY}` },
             signal: context.signal,

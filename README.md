@@ -34,7 +34,9 @@ OpenCode plugin that registers a `generate_image` tool — but the model runs
 **on the host MacBook**, not on your machine. The plugin submits a job to
 the host's image service over Tailscale, shows your queue position while
 you wait, and saves the finished PNG to `~/.mtplx/h3-image-mlx/out/`
-(`%USERPROFILE%\.mtplx\h3-image-mlx\out\` on Windows). A 1024×1024 image
+(`%USERPROFILE%\.mtplx\h3-image-mlx\out\` on Windows) — or anywhere else you
+ask for ("save it to my Desktop" works: the tool accepts an output path). A
+1024×1024 image
 takes roughly 20–30 s on the host plus any queue wait; jobs are serialised,
 so heavy traffic just means a longer queue, and you need no local model,
 disk, or Apple Silicon. This works the same on Windows. You can pass one or
