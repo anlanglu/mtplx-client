@@ -9,13 +9,12 @@
 
       1. Installs Tailscale            (winget install --id Tailscale.Tailscale)
       2. Installs OpenCode             (standalone Windows zip to ~/.opencode/bin)
-      3. Installs the mtplx-session-headers plugin (bundled below, self-contained)
+      3. Installs both plugins: mtplx-session-headers (routing fixes) and
+         mtplx-image-generation (a `generate_image` tool that calls the
+         host's image job service — nothing model-related is installed here)
       4. Writes ~/.config/opencode/opencode.jsonc so all five MTPLX providers
          point at the host's Tailscale URL with your personal API key
-      5. Would install MiniMax H3-Image locally — NOT SUPPORTED on Windows
-         (it is an MLX model and needs Apple Silicon). Use -SkipImage on
-         Apple-silicon Macs running the .sh installer to leave it out.
-      6. Logs Tailscale in (prints a URL you click exactly once)
+      5. Logs Tailscale in (prints a URL you click exactly once)
 
     Only prompts and streamed completion tokens cross the wire — the session,
     files and tool output stay on this machine. That is what keeps it usable on a
@@ -36,8 +35,8 @@
 .PARAMETER SkipOpencode
     Skip the OpenCode install step.
 .PARAMETER SkipImage
-    Accepted for parity with the macOS script; on Windows local image
-    generation is skipped anyway (H3-Image requires Apple Silicon).
+    Do not install the image-generation plugin at all (by default it is
+    installed and calls the host's image job service over Tailscale).
 .PARAMETER NoVerify
     Skip the network verification at the end.
 .PARAMETER Help
@@ -67,7 +66,7 @@ param(
     [Parameter(HelpMessage="Skip OpenCode install step")]
     [switch]$SkipOpencode,
 
-    [Parameter(HelpMessage="Skip local H3-Image (Windows skips it anyway — needs Apple Silicon)")]
+    [Parameter(HelpMessage="Do not install the image-generation plugin at all")]
     [switch]$SkipImage,
 
     [Parameter(HelpMessage="Skip network verification at the end")]
@@ -98,7 +97,7 @@ function Get-HelpText {
     Write-Output "  -Fresh       Write a clean config instead of merging."
     Write-Output "  -SkipTailscale  Skip Tailscale install."
     Write-Output "  -SkipOpencode   Skip OpenCode install."
-    Write-Output "  -SkipImage      Skip local H3-Image (automatic: not supported on Windows)."
+    Write-Output "  -SkipImage      Do not install the image-generation plugin at all."
     Write-Output "  -NoVerify      Skip network verification."
 }
 
@@ -171,6 +170,8 @@ $PLUGIN_INDEX = Join-Path $PLUGIN_DIR "index.js"
 $PLUGIN_SERVER = Join-Path $PLUGIN_DIR "server.js"
 $PLUGIN_PKG = Join-Path $PLUGIN_DIR "package.json"
 $IMAGE_PLUGIN_DIR = Join-Path $OC_CONFIG_DIR "plugins" "mtplx-image-generation"
+$IMAGE_PLUGIN_INDEX = Join-Path $IMAGE_PLUGIN_DIR "index.js"
+$IMAGE_PLUGIN_PKG = Join-Path $IMAGE_PLUGIN_DIR "package.json"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -209,13 +210,13 @@ if ($isAdmin) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1/6: Install Tailscale
+# Step 1/5: Install Tailscale
 # ---------------------------------------------------------------------------
 if ($SkipTailscale) {
-    Step "1/6  Install Tailscale (skipped)"
+    Step "1/5  Install Tailscale (skipped)"
     Info "-SkipTailscale set."
 } else {
-    Step "1/6  Install Tailscale"
+    Step "1/5  Install Tailscale"
 
     if (Test-Command "tailscale") {
         Ok "Tailscale CLI already installed"
@@ -262,13 +263,13 @@ if ($SkipTailscale) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 2/6: Install OpenCode
+# Step 2/5: Install OpenCode
 # ---------------------------------------------------------------------------
 if ($SkipOpencode) {
-    Step "2/6  Install OpenCode (skipped)"
+    Step "2/5  Install OpenCode (skipped)"
     Info "-SkipOpencode set."
 } else {
-    Step "2/6  Install OpenCode"
+    Step "2/5  Install OpenCode"
 
     if (Test-Path $OC_BIN) {
         $ver = & $OC_BIN --version 2>&1 | Select-String -Pattern "opencode" | Select-Object -First 1
@@ -337,14 +338,15 @@ if ($SkipOpencode) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3/6: Install MTPLX plugins
+# Step 3/5: Install MTPLX plugins
 #
-#   • mtplx-session-headers  (routing fixes) — installed here.
-#   • mtplx-image-generation (local generate_image tool) — NOT installed:
-#     H3-Image is an MLX model that only runs on Apple Silicon, so on
-#     Windows there is nothing for the tool to call.
+#   • mtplx-session-headers  (routing fixes)
+#   • mtplx-image-generation (generate_image via the host's job service)
+#
+# Both talk to the host over Tailscale, so a cheap Windows box works fine:
+# nothing model-related is installed on this machine.
 # ---------------------------------------------------------------------------
-Step "3/6  Install MTPLX plugins"
+Step "3/5  Install MTPLX plugins"
 
 if (Test-Path $PLUGIN_INDEX) {
     Ok "mtplx-session-headers already installed"
@@ -469,15 +471,268 @@ export default {
 if ($SkipImage) {
     Info "-SkipImage set: image-generation plugin not installed."
 } else {
-    Info "H3-Image is an MLX model and only runs on Apple Silicon (macOS)."
-    Info "The image-generation plugin is not installed here; there is nothing"
-    Info "for its 'generate_image' tool to call on Windows."
+    if (-not (Test-Path $IMAGE_PLUGIN_DIR)) {
+        New-Item -ItemType Directory -Path $IMAGE_PLUGIN_DIR -Force | Out-Null
+    }
+
+    # index.js — an HTTP client for the host's image job service. Written
+    # from a non-expanding here-string, then __MTPLX_BASE__ and
+    # __MTPLX_KEY__ are replaced with this host's URL and this user's key.
+    $imgIndex = @'
+// MTPLX image generation via MiniMax H3-Image, run on the MTPLX host.
+//
+// Registers one agent-callable tool, `generate_image`, that calls the host's
+// image job service (mtplx-image-service.py) over the tailnet:
+//
+//   POST <base>/image/v1/jobs          -> submit, get job id + queue position
+//   GET  <base>/image/v1/jobs/<id>     -> poll status (position while queued)
+//   GET  <base>/image/v1/jobs/<id>/image -> download the finished PNG
+//
+// The host serialises jobs, so any number of clients can fire at once; each
+// one sees its queue position here through context.progress and the file
+// lands in ~/.mtplx/h3-image-mlx/out/ on this machine. No local model, no
+// Apple Silicon needed — this works the same on Windows.
+//
+// The MTPLX installer replaces __MTPLX_BASE__ (host URL, e.g.
+// https://<host>.<tailnet>.ts.net) and __MTPLX_KEY__ (your mtr_ key) when
+// it writes this file. With placeholders left in place the tool still
+// registers, but returns a clear "not installed" message.
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { Plugin } from "@opencode/plugin";
+
+const BASE = "__MTPLX_BASE__"; // e.g. https://host.tailnet.ts.net
+const KEY = "__MTPLX_KEY__";   // your mtr_... API key
+const API = `${BASE}/image`;
+
+const OUT_DIR = path.join(os.homedir(), ".mtplx", "h3-image-mlx", "out");
+const POLL_MS = 5000;
+const OVERALL_TIMEOUT_MS = 60 * 60 * 1000; // queue + generation combined
+
+const installed = !BASE.startsWith("__") && !KEY.startsWith("__");
+
+const round32 = (value, fallback) => {
+  const raw = Number.isInteger(value) ? value : fallback;
+  const clamped = Math.min(4096, Math.max(256, raw));
+  return Math.round(clamped / 32) * 32;
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// fetch with a JSON response; throws with the server's error message.
+const request = async (url, init) => {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = (await res.json())?.error?.message || "";
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
+  }
+  return res;
+};
+
+const jobStatus = async (jobId, signal) =>
+  (
+    await request(`${API}/v1/jobs/${jobId}`, {
+      headers: { Authorization: `Bearer ${KEY}` },
+      signal,
+    })
+  ).json();
+
+export default Plugin.define({
+  id: "mtplx.image-generation",
+  async setup(ctx) {
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "generate_image",
+        description:
+          "Generate or edit an image with MiniMax H3-Image, generated on the " +
+          "MTPLX host over the tailnet. Text-to-image, or image editing when " +
+          "reference images are given. Takes roughly 30-120s per 1024x1024 " +
+          "image (longer if the queue is busy) and returns the path of the saved PNG.",
+        input: {
+          type: "object",
+          properties: {
+            prompt: {
+              type: "string",
+              description:
+                "Describe the image to generate, or the edit to apply when references are given. " +
+                "Be concrete: subject, style, lighting, composition.",
+            },
+            width: {
+              type: "integer",
+              description: "Output width in pixels, multiple of 32, 256-4096. Default 1024.",
+            },
+            height: {
+              type: "integer",
+              description: "Output height in pixels, multiple of 32, 256-4096. Default 1024.",
+            },
+            seed: {
+              type: "integer",
+              description: "Optional seed for reproducible output.",
+            },
+            references: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Absolute paths to up to 16 reference images to edit. Provide when the task is to " +
+                "edit or remix existing pictures rather than a fresh generation.",
+            },
+          },
+          required: ["prompt"],
+          additionalProperties: false,
+        },
+        options: { codemode: false },
+        execute: async (input, context) => {
+          if (!installed) {
+            return {
+              content:
+                "Image generation is not configured: this plugin still holds the " +
+                "__MTPLX_BASE__/__MTPLX_KEY__ placeholders. Run the MTPLX client " +
+                "installer, or edit ~/.config/opencode/plugins/mtplx-image-generation/index.js " +
+                "and replace them with your host URL and mtr_ key.",
+            };
+          }
+          const refs = Array.isArray(input.references)
+            ? input.references.filter((r) => typeof r === "string").slice(0, 16)
+            : [];
+          const missing = refs.filter((r) => !existsSync(r));
+          if (missing.length) {
+            return { content: `Reference image(s) not found: ${missing.join(", ")}` };
+          }
+
+          // Read reference images and inline them as base64 for the host.
+          let references = [];
+          for (const refPath of refs) {
+            const buf = await readFile(refPath);
+            if (buf.length > 16 * 1024 * 1024) {
+              return { content: `${refPath} is over the 16 MB per-reference limit.` };
+            }
+            references.push({
+              name: path.basename(refPath),
+              data_base64: buf.toString("base64"),
+            });
+          }
+
+          const deadline = Date.now() + OVERALL_TIMEOUT_MS;
+          const body = {
+            prompt: String(input.prompt),
+            width: round32(input.width, 1024),
+            height: round32(input.height, 1024),
+          };
+          if (Number.isInteger(input.seed)) body.seed = input.seed;
+          if (references.length) body.references = references;
+
+          // 1. Submit the job.
+          let job;
+          try {
+            const res = await request(`${API}/v1/jobs`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${KEY}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(body),
+              signal: context.signal,
+            });
+            job = await res.json();
+          } catch (e) {
+            return {
+              content:
+                `Could not submit the image job to the MTPLX host (${API}): ` +
+                `${String(e).slice(0, 300)}. Check Tailscale is up and the host's ` +
+                "image service is running (`tailscale serve status` on the host).",
+            };
+          }
+
+          // 2. Poll until done/failed, surfacing queue position.
+          let status = job;
+          while (status.status === "queued" || status.status === "running") {
+            if (Date.now() > deadline) {
+              return {
+                content:
+                  `Job ${job.job_id} is still ${status.status} after ` +
+                  `${OVERALL_TIMEOUT_MS / 60000} minutes; check back with ` +
+                  `GET ${API}/v1/jobs/${job.job_id}.`,
+              };
+            }
+            const pos =
+              typeof status.position === "number" ? status.position : null;
+            await context.progress({
+              status:
+                status.status === "running"
+                  ? "H3-Image is generating your image…"
+                  : `Waiting for H3-Image (${pos === 0 ? "next in" : pos} in front of the queue)…`,
+            });
+            await sleep(POLL_MS);
+            status = await jobStatus(job.job_id, context.signal);
+          }
+
+          if (status.status !== "done") {
+            return {
+              content: `Image job ${job.job_id} ${status.status}: ${status.error || "no further detail"}.`,
+            };
+          }
+
+          // 3. Download the PNG to the local out directory.
+          await mkdir(OUT_DIR, { recursive: true });
+          const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+          const outPath = path.join(
+            OUT_DIR,
+            `h3-${stamp}-${Math.random().toString(36).slice(2, 6)}.png`,
+          );
+          const imgRes = await request(`${API}/v1/jobs/${job.job_id}/image`, {
+            headers: { Authorization: `Bearer ${KEY}` },
+            signal: context.signal,
+          });
+          await writeFile(outPath, Buffer.from(await imgRes.arrayBuffer()));
+
+          return {
+            content:
+              `Image saved to ${outPath} (${status.width}x${status.height}` +
+              `${Number.isInteger(status.seed) ? `, seed ${status.seed}` : ""}). ` +
+              "Show it to the user by reading that file, and mention where it is. " +
+              "Powered by MiniMax-H3-Image.",
+          };
+        },
+      });
+    });
+  },
+});
+'@
+
+    $imgPkg = @'
+{
+  "name": "mtplx-image-generation",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+'@
+
+    $imgIndex = $imgIndex.Replace("__MTPLX_BASE__", $Base).Replace("__MTPLX_KEY__", $Key)
+    if ($imgIndex -match '__MTPLX_') {
+        Err "placeholder substitution failed in the image plugin."
+        exit 1
+    }
+    Set-Content -Path $IMAGE_PLUGIN_INDEX -Value $imgIndex -Encoding UTF8
+    Set-Content -Path $IMAGE_PLUGIN_PKG -Value $imgPkg -Encoding UTF8
+    Ok "plugin written to $IMAGE_PLUGIN_DIR (host: $Base/image)"
 }
 
 # ---------------------------------------------------------------------------
-# Step 4/6: Write OpenCode config
+# Step 4/5: Write OpenCode config
 # ---------------------------------------------------------------------------
-Step "4/6  Write OpenCode config"
+Step "4/5  Write OpenCode config"
 
 # Ensure directories exist
 if (-not (Test-Path $OC_CONFIG_DIR)) {
@@ -509,9 +764,7 @@ $env:MTPLX_PLUGIN_DIR = $PLUGIN_DIR
 $env:MTPLX_CFG_FILE = $OC_CONFIG_FILE
 $env:MTPLX_FRESH = if ($Fresh) { "1" } else { "0" }
 $env:MTPLX_IMAGE_PLUGIN_DIR = $IMAGE_PLUGIN_DIR
-# On Windows local image generation is never available (needs Apple
-# Silicon), so the image plugin is never registered.
-$env:MTPLX_SKIP_IMG = "1"
+$env:MTPLX_SKIP_IMG = if ($SkipImage) { "1" } else { "0" }
 
 $pythonScript = @'
 import json, os, sys, urllib.request, urllib.error
@@ -716,23 +969,9 @@ try {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5/6: Install MiniMax H3-Image — skipped on Windows
+# Step 5/5: Log in to Tailscale
 # ---------------------------------------------------------------------------
-if ($SkipImage) {
-    Step "5/6  Install MiniMax H3-Image (skipped)"
-    Info "-SkipImage set; the generate_image tool will report 'not installed' until you install it."
-} else {
-    Step "5/6  Install MiniMax H3-Image"
-    Info "H3-Image is distributed as an MLX model (Apple Metal) and only"
-    Info "supports macOS on Apple Silicon. Nothing to install on Windows."
-    Info "If you re-run this on an Apple-silicon Mac with the .sh installer,"
-    Info "step 5/6 sets up python@3.12, h3-image-mlx and ~49 GB of weights."
-}
-
-# ---------------------------------------------------------------------------
-# Step 6/6: Log in to Tailscale
-# ---------------------------------------------------------------------------
-Step "6/6  Log in to Tailscale"
+Step "5/5  Log in to Tailscale"
 
 if (-not (Test-Command "tailscale")) {
     # winget may place tailscale.exe in Program Files without refreshing PATH.
@@ -860,6 +1099,20 @@ except Exception: print('    '+sys.stdin.read()[:200])" 2>$null
         Err "  → check the key; the host revokes with './mtplx-router.sh key rm <name>'."
     }
 
+    Info "Checking the host-side image job service..."
+    try {
+        $imgHealth = curl -fsS -m 15 "${Base}/image/health" 2>&1
+        if ($imgHealth) {
+            Ok "image service reachable: $imgHealth"
+        } else {
+            Warn "Image service returned empty response at ${Base}/image/health."
+        }
+    } catch {
+        Warn "Could not reach the image service at ${Base}/image/health."
+        Warn "  → the host's mtplx-image service may not be running; generate_image"
+        Warn "    will report that until the host restarts it."
+    }
+
     # Verify OpenCode binary works
     if (Test-Path $OC_BIN) {
         try {
@@ -877,6 +1130,8 @@ except Exception: print('    '+sys.stdin.read()[:200])" 2>$null
     Write-Output "         opencode"
     Write-Output "  2. It starts on MTPLX 27B by default; switch with /models,"
     Write-Output "     subagents run on 9B."
+    Write-Output "  3. Ask it to generate an image — the generate_image tool runs"
+    Write-Output "     on the host, so this machine never needs a model of its own."
     Write-Output ""
     Info "Your API key and the host URL live in $OC_CONFIG_FILE"
     Info "Re-run this script any time to re-verify or repair the setup."
