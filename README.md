@@ -27,23 +27,28 @@ only prompts and token streams cross the wire (~1.2 MB/s upload).
 Flash-Next loads ~99 GB and evicts other models — the first request triggers a
 brief 503 on the other models. That's expected.
 
-### Image generation (runs on the host)
+### Media generation (runs on the host)
 
-The installer also sets up **image generation with MiniMax H3-Image** via an
-OpenCode plugin that registers a `generate_image` tool — but the model runs
-**on the host MacBook**, not on your machine. The plugin submits a job to
-the host's image service over Tailscale, shows your queue position while
-you wait, and saves the finished PNG to `~/.mtplx/h3-image-mlx/out/`
-(`%USERPROFILE%\.mtplx\h3-image-mlx\out\` on Windows) — or anywhere else you
-ask for ("save it to my Desktop" works: the tool accepts an output path). A
-1024×1024 image
-takes roughly 20–30 s on the host plus any queue wait; jobs are serialised,
-so heavy traffic just means a longer queue, and you need no local model,
-disk, or Apple Silicon. This works the same on Windows. You can pass one or
-more local reference images and the host will edit them. The weights are
-gated behind the MiniMax Community License (not usable in US/EU/UK/South
-Korea, and not for improving other AI models). Use `--skip-image` /
-`-SkipImage` if you don't want the tool at all.
+The installer also sets up **image and video generation with MiniMax
+H3-Image / H3-Video** via an OpenCode plugin that registers a
+`generate_image` and a `generate_video` tool — but the models run **on the
+host MacBook**, not on your machine. The plugin submits a job to the host's
+image/video service over Tailscale, shows your queue position while you
+wait, and saves the finished PNG to `~/.mtplx/h3-image-mlx/out/` (or the
+MP4 to `~/.mtplx/h3-video-mlx/out/`; `%USERPROFILE%\.mtplx\...` on
+Windows) — or anywhere else you ask for ("save it to my Desktop" works:
+the tool accepts an output path). A 1024×1024 image takes roughly 20–30 s
+on the host plus any queue wait; **a 5-second video clip takes roughly
+2.2–2.5 hours**, so only ask for one when you really want it (and keep the
+session open, or re-check later with the job id shown in the tool output).
+Jobs are serialised on a single host-side lock, so heavy traffic just means
+a longer queue, and you need no local model, disk, or Apple Silicon. This
+works the same on Windows. `generate_image` can take one or more local
+reference images and the host will edit them; `generate_video` can animate
+a local keyframe image (as the first or last frame of the clip). The
+weights are gated behind the MiniMax Community License (not usable in
+US/EU/UK/South Korea, and not for improving other AI models). Use
+`--skip-image` / `-SkipImage` if you don't want either tool at all.
 
 ## Prerequisites
 
@@ -79,12 +84,13 @@ chmod +x mtplx-client-install.sh
 2. Installs OpenCode (latest release)
 3. Installs the `mtplx-session-headers` plugin (byte-identical to host
    version) and the `mtplx-image-generation` plugin (an HTTP client for the
-   host's image job service — see Image generation above; also shipped in
-   this repo under `plugins/`). Use `--skip-image` to skip the image plugin
+   host's image and video job services — see Media generation above; also
+   shipped in this repo under `plugins/`). Use `--skip-image` to skip the
+   media plugin
 4. Writes `~/.config/opencode/opencode.jsonc` with all 5 providers and both
    plugins
 5. Logs you in to Tailscale if needed, then verifies connectivity to the
-   router and the host's image service
+   router and the host's image and video services
 
 **Options:**
 - `--fresh` — write a clean MTPLX-only config (preserves existing config as
@@ -110,12 +116,13 @@ cd C:\Users\<user>\Downloads
 1. Installs Tailscale (via winget) and logs in if needed
 2. Downloads and extracts OpenCode for Windows
 3. Installs the `mtplx-session-headers` plugin (byte-identical to host
-   version) and the `mtplx-image-generation` plugin — image generation runs
-   on the host, so Windows gets it too (`-SkipImage` skips the image tool)
+   version) and the `mtplx-image-generation` plugin — image and video
+   generation run on the host, so Windows gets them too (`-SkipImage`
+   skips the media tools)
 4. Writes `%USERPROFILE%\.config\opencode\opencode.jsonc` with all 5
    providers and both plugins
 5. Logs you in to Tailscale if needed, then verifies connectivity to the
-   router and the host's image service
+   router and the host's image and video services
 
 **Options:**
 - `-Fresh` — write a clean MTPLX-only config (preserves existing config as
@@ -149,8 +156,10 @@ opencode
 - Starts on **MTPLX 27B** by default
 - Switch models with `/models`
 - Subagents run on **9B** (`mtplx`)
-- Ask for an image (e.g. "draw me a…") — the agent uses the `generate_image`
-  tool, which runs on the host; it is not a router model
+- Ask for an image (e.g. "draw me a…") or a short clip (e.g. "animate
+  this") — the agent uses the `generate_image` / `generate_video` tools,
+  which run on the host; they are not router models. Video jobs take hours,
+  so confirm with the agent before firing one.
 - If you see 503 errors on the first Flash-Next request, that's normal
   (it loads ~99 GB and evicts other models). Subsequent requests will be fast.
 
